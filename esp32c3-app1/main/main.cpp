@@ -13,22 +13,26 @@
 #include "mqtt_client.h"
 #include "esp_timer.h"
 
-// ========== 配置区域（已保持您的配置，并适配ESP32-C3引脚） ==========
-const char* ssid          = "zh5501";
-const char* password      = "lj83759355!!";
-// EMQX 8883 默认是 SSL 加密端口，ESP-IDF 连 8883 需要证书。
-// 建议先使用 mqtt:// 配合非加密端口 1883。这里先为你指向你的服务器。
-const char* mqtt_server   = "mqtt://u1617077.ala.asia-southeast1.emqxsl.com:8883"; 
+// ========== 配置区域 ==========
+const char* ssid          = "LightSpeed";
+const char* password      = "83653316zzn";
+
+const char* mqtt_server   = "u1617077.ala.asia-southeast1.emqxsl.com";
+const uint32_t mqtt_port  = 8883;
 const char* mqtt_user     = "hjzzn";     
 const char* mqtt_password = "netzzn";   
 
-// ESP32-C3 只有 0~21 号引脚，已为您更换为 C3 可用的引脚
+// 从外部嵌入文件引入证书指针
+extern const uint8_t emqxsl_ca_crt_start[] asm("_binary_emqxsl_ca_crt_start");
+extern const uint8_t emqxsl_ca_crt_end[]   asm("_binary_emqxsl_ca_crt_end");
+
+// ESP32-C3 引脚配置
 const gpio_num_t optoPin  = GPIO_NUM_5;     // 连接到光耦输入端的引脚（控制开机）
 const gpio_num_t statePin = GPIO_NUM_4;     // 连接到电脑USB 5V的引脚（检测状态）
 
 // MQTT Topics
-const std::string topic_cmd  = "cmnd/pc/power";     // 接收控制指令的主题
-const std::string topic_stat = "tele/pc/state";    // 发送状态反馈的主题
+const std::string topic_switch_status = "SWITCH/e1784b9a-1f8e-48e1-8fbf-aa37bfd87ba2/STATUS"; // ✨ 已修改变量名
+const std::string topic_switch_cmd    = "SWITCH/e1784b9a-1f8e-48e1-8fbf-aa37bfd87ba2/POWER";  // 开关控制主题 
 
 // 定时汇报状态的相关变量
 unsigned long lastStatusCheck = 0;
@@ -63,8 +67,8 @@ void reportCurrentState() {
     if (!mqtt_connected || client == NULL) return;
     std::string currentState = getComputerState();
     
-    // 发送 Retain 消息
-    esp_mqtt_client_publish(client, topic_stat.c_str(), currentState.c_str(), 0, 1, 1);
+    // 发送 Retain 消息（使用修改后的变量名 topic_switch_status）
+    esp_mqtt_client_publish(client, topic_switch_status.c_str(), currentState.c_str(), 0, 1, 1);
     lastState = currentState;
     
     ESP_LOGI(TAG, "Reported state to MQTT: %s", currentState.c_str());
@@ -89,26 +93,33 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         case MQTT_EVENT_CONNECTED:
             ESP_LOGI(TAG, "connected");
             mqtt_connected = true;
-            esp_mqtt_client_subscribe(client, topic_cmd.c_str(), 1);
+            
+            // 订阅简化后的唯一控制主题
+            esp_mqtt_client_subscribe(client, topic_switch_cmd.c_str(), 1);
+            ESP_LOGI(TAG, "Subscribed to topic: %s", topic_switch_cmd.c_str());
+            
             reportCurrentState();
             break;
+            
         case MQTT_EVENT_DISCONNECTED:
             ESP_LOGI(TAG, "MQTT disconnected");
             mqtt_connected = false;
             break;
+            
         case MQTT_EVENT_DATA: {
             std::string topic(event->topic, event->topic_len);
             std::string messageTemp(event->data, event->data_len);
             
             ESP_LOGI(TAG, "Message arrived [%s] %s", topic.c_str(), messageTemp.c_str());
 
-            if (topic == topic_cmd) {
+            // 只处理简化后的单一控制主题消息
+            if (topic == topic_switch_cmd) {
                 if (messageTemp == "ON" || messageTemp == "TOGGLE" || messageTemp == "PRESS") {
-                    ESP_LOGI(TAG, "Triggering Power Button...");
+                    ESP_LOGI(TAG, "Triggering Power Button via %s...", topic.c_str());
                     xTaskCreate(trigger_power_task, "pwr_task", 2048, (void*)(uintptr_t)500, 5, NULL);
                 } 
                 else if (messageTemp == "FORCE_OFF") {
-                    ESP_LOGI(TAG, "Triggering Force Hard Shutdown...");
+                    ESP_LOGI(TAG, "Triggering Force Hard Shutdown via %s...", topic.c_str());
                     xTaskCreate(trigger_power_task, "pwr_task", 2048, (void*)(uintptr_t)5000, 5, NULL);
                 }
             }
@@ -168,47 +179,52 @@ void setup() {
     io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
     io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
     gpio_config(&io_conf);
-    gpio_set_level(optoPin, 0);  // 默认断开
+    gpio_set_level(optoPin, 0);  
 
     io_conf.mode = GPIO_MODE_INPUT;
     io_conf.pin_bit_mask = (1ULL << statePin);
-    io_conf.pull_down_en = GPIO_PULLDOWN_ENABLE; // 启用下拉，防止悬空
+    io_conf.pull_down_en = GPIO_PULLDOWN_ENABLE; 
     gpio_config(&io_conf);
 
     setup_wifi();
 
-    // 初始化 MQTT
+    // 初始化 MQTT 结构体
     esp_mqtt_client_config_t mqtt_cfg = {};
-    mqtt_cfg.broker.address.uri = mqtt_server;
+    mqtt_cfg.broker.address.hostname = mqtt_server;     
+    mqtt_cfg.broker.address.port = mqtt_port;           
+    mqtt_cfg.broker.address.transport = MQTT_TRANSPORT_OVER_SSL; 
+
+    // 将外部嵌入的二进制证书内容和长度精准配置进去
+    mqtt_cfg.broker.verification.certificate = reinterpret_cast<const char*>(emqxsl_ca_crt_start);
+    mqtt_cfg.broker.verification.certificate_len = emqxsl_ca_crt_end - emqxsl_ca_crt_start; 
+
+    mqtt_cfg.credentials.client_id = "my_unique_esp32c3_device_01";
     mqtt_cfg.credentials.username = mqtt_user;
     mqtt_cfg.credentials.authentication.password = mqtt_password;
     
     client = esp_mqtt_client_init(&mqtt_cfg);
-    esp_mqtt_client_register_event(client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+    esp_mqtt_client_register_event(client, static_cast<esp_mqtt_event_id_t>(ESP_EVENT_ANY_ID), mqtt_event_handler, NULL);
     esp_mqtt_client_start(client);
 }
 
 // 模拟 Arduino 的 loop() 的后台 FreeRTOS 任务
 void loop_task(void *pvParameters) {
     while (true) {
-        // 定时检查状态（非阻塞式定时器）
         unsigned long now = millis();
         if (now - lastStatusCheck > checkInterval) {
             lastStatusCheck = now;
             
             std::string currentState = getComputerState();
-            // 只有当状态发生改变时，才向 MQTT 发送数据
             if (currentState != lastState) {
                 reportCurrentState();
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(100)); // 释放 CPU，每 100ms 检查一次时间轴
+        vTaskDelay(pdMS_TO_TICKS(100)); 
     }
 }
 
 // ESP-IDF 引导总入口
 extern "C" void app_main(void) {
-    // 初始化 NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -216,9 +232,6 @@ extern "C" void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
-    // 执行初始化
     setup();
-
-    // 创建后台任务来跑原本 loop() 里的内容
     xTaskCreate(loop_task, "loop_task", 3072, NULL, 4, NULL);
 }
